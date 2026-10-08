@@ -316,20 +316,45 @@ class AGEStorage(BaseGraphStorage):
         async with self._get_pool_connection() as conn:
             async with conn.cursor() as curs:
                 try:
+                    # First check if AGE extension exists
+                    await curs.execute("""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM pg_extension WHERE extname = 'age'
+                            ) THEN
+                                CREATE EXTENSION age;
+                            END IF;
+                        END
+                        $$;
+                    """)
+                    
+                    # Set search path to include ag_catalog
                     await curs.execute('SET search_path = ag_catalog, "$user", public')
-                    await curs.execute(f"SELECT create_graph('{self.graph_name}')")
+                    
+                    # Check if graph exists before creating
+                    await curs.execute("""
+                        SELECT * FROM ag_catalog.ag_graph WHERE name = %s
+                    """, (self.graph_name,))
+                    result = await curs.fetchall()
+                    
+                    if not result:
+                        await curs.execute("SELECT create_graph(%s)", (self.graph_name,))
+                        logger.info(f"Created graph {self.graph_name}")
+                    else:
+                        logger.info(f"Graph {self.graph_name} already exists")
+                    
                     await conn.commit()
-                except (
-                    psycopg.errors.InvalidSchemaName,
-                    psycopg.errors.UniqueViolation,
-                ):
+                except Exception as e:
+                    logger.error(f"Error in AGE setup: {str(e)}")
                     await conn.rollback()
+                    raise
 
         # execute the query, rolling back on an error
         async with self._get_pool_connection() as conn:
             async with conn.cursor(row_factory=namedtuple_row) as curs:
                 try:
-                    await curs.execute('SET search_path = ag_catalog, "$user", public')
+                    # await curs.execute('SET search_path = ag_catalog, "$user", public')
                     await curs.execute(wrapped_query)
                     await conn.commit()
                 except psycopg.Error as e:
@@ -401,7 +426,7 @@ class AGEStorage(BaseGraphStorage):
             logger.debug(
                 "{%s}: query: {%s}, result: {%s}",
                 inspect.currentframe().f_code.co_name,
-                query.format(**params),
+                query,
                 node_dict,
             )
             return node_dict
@@ -595,7 +620,6 @@ class AGEStorage(BaseGraphStorage):
 
     async def _node2vec_embed(self):
         print("Implemented but never called.")
-
     @asynccontextmanager
     async def _get_pool_connection(self, timeout: Optional[float] = None):
         """Workaround for a psycopg_pool bug"""
@@ -611,3 +635,4 @@ class AGEStorage(BaseGraphStorage):
                 yield connection
         finally:
             await self._driver.putconn(connection)
+

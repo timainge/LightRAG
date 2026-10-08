@@ -101,7 +101,7 @@ class PostgreSQLDB:
                 if for_age:
                     await PostgreSQLDB._prerequisite(connection, graph_name)
                 if params:
-                    rows = await connection.fetch(sql, *params.values())
+                        rows = await connection.fetch(sql, *params.values())
                 else:
                     rows = await connection.fetch(sql)
 
@@ -158,13 +158,75 @@ class PostgreSQLDB:
     @staticmethod
     async def _prerequisite(conn: asyncpg.Connection, graph_name: str):
         try:
+            # First check if AGE extension exists
+            await conn.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_extension WHERE extname = 'age'
+                    ) THEN
+                        CREATE EXTENSION age;
+                    END IF;
+                END
+                $$;
+            """)
+            
+            # Set search path to include ag_catalog
             await conn.execute('SET search_path = ag_catalog, "$user", public')
-            await conn.execute(f"""select create_graph('{graph_name}')""")
-        except (
-            asyncpg.exceptions.InvalidSchemaNameError,
-            asyncpg.exceptions.UniqueViolationError,
-        ):
-            pass
+            
+            # Check if graph exists before creating
+            result = await conn.fetch("""
+                SELECT * FROM ag_catalog.ag_graph WHERE name = $1
+            """, graph_name)
+            
+            if not result:
+                await conn.execute("SELECT create_graph($1)", graph_name)
+                logger.info(f"Created graph {graph_name}")
+            else:
+                logger.info(f"Graph {graph_name} already exists")
+                
+        except Exception as e:
+            logger.error(f"Error in AGE setup: {str(e)}")
+            raise
+
+    async def clear_all_tables(self):
+        """Clear all LightRAG tables for the current workspace"""
+        # Order matters due to foreign key constraints
+        tables = [
+            # Delete dependent tables first
+            "LIGHTRAG_VDB_RELATION",    # Has foreign keys to ENTITY
+            "LIGHTRAG_DOC_CHUNKS",      # Has foreign key to DOC_FULL
+            "LIGHTRAG_VDB_ENTITY",      # Independent
+            "LIGHTRAG_DOC_STATUS",      # Independent
+            "LIGHTRAG_DOC_FULL",        # Independent
+            "LIGHTRAG_LLM_CACHE"        # Independent
+        ]
+        
+        for table in tables:
+            logger.info(f"Clearing {table}...")
+            try:
+                await self.execute(f"DELETE FROM {table} WHERE EXISTS (SELECT 1 FROM {table}) AND workspace=$1",
+                                 {"workspace": self.workspace})
+            except Exception as e:
+                logger.warning(f"Error clearing {table}: {e}")
+        
+        # Clear AGE graph if it exists
+        if hasattr(self, 'graph_name'):
+            try:
+                await self.execute('SET search_path = ag_catalog, "$user", public')
+                # Check if graph exists before dropping
+                result = await self.execute("""
+                    SELECT 1 FROM ag_catalog.ag_graph WHERE name = $1
+                """, {"name": self.graph_name})
+                if result:
+                    await self.execute(f"SELECT drop_graph('{self.graph_name}', true)")
+                    logger.info(f"Dropped AGE graph {self.graph_name}")
+                else:
+                    logger.info(f"Graph {self.graph_name} does not exist")
+            except Exception as e:
+                logger.warning(f"Error dropping AGE graph: {e}")
+
+        logger.info("All tables cleared")
 
 
 @dataclass
@@ -412,7 +474,9 @@ class PGDocStatusStorage(DocStatusStorage):
 
     async def filter_keys(self, data: list[str]) -> set[str]:
         """Return keys that don't exist in storage"""
-        sql = f"SELECT id FROM LIGHTRAG_DOC_STATUS WHERE workspace=$1 AND id IN ({",".join([f"'{_id}'" for _id in data])})"
+        quoted_ids = [f"'{id}'" for id in data]
+        id_list = ','.join(quoted_ids)
+        sql = f"SELECT id FROM LIGHTRAG_DOC_STATUS WHERE workspace=$1 AND id IN ({id_list})"
         result = await self.db.query(sql, {"workspace": self.db.workspace}, True)
         # The result is like [{'id': 'id1'}, {'id': 'id2'}, ...].
         if result is None:
@@ -1145,17 +1209,17 @@ SQL_TEMPLATES = {
     # SQL for VectorStorage
     "entities": """SELECT entity_name FROM
         (SELECT id, entity_name, 1 - (content_vector <=> '[{embedding_string}]'::vector) as distance
-        FROM LIGHTRAG_VDB_ENTITY where workspace=$1)
+        FROM LIGHTRAG_VDB_ENTITY where workspace=$1) as entities
         WHERE distance>$2 ORDER BY distance DESC  LIMIT $3
        """,
     "relationships": """SELECT source_id as src_id, target_id as tgt_id FROM
         (SELECT id, source_id,target_id, 1 - (content_vector <=> '[{embedding_string}]'::vector) as distance
-        FROM LIGHTRAG_VDB_RELATION where workspace=$1)
+        FROM LIGHTRAG_VDB_RELATION where workspace=$1) as rels
         WHERE distance>$2 ORDER BY distance DESC  LIMIT $3
        """,
     "chunks": """SELECT id FROM
         (SELECT id, 1 - (content_vector <=> '[{embedding_string}]'::vector) as distance
-        FROM LIGHTRAG_DOC_CHUNKS where workspace=$1)
+        FROM LIGHTRAG_DOC_CHUNKS where workspace=$1) as chunks
         WHERE distance>$2 ORDER BY distance DESC  LIMIT $3
        """,
 }
